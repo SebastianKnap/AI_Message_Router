@@ -1,0 +1,93 @@
+name: ai-message-router
+
+# Image tags are pinned on purpose: `latest` would silently change what a reviewer runs.
+
+services:
+  # Local LLM engine. Model weights live in a named volume so they survive restarts.
+  ollama:
+    image: ollama/ollama:0.32.3
+    # Exposed on the host so the model can be queried directly while debugging
+    # (see eval/). The API talks to it over the compose network, not through this port.
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      # Ollama unloads an idle model after 5 minutes. That would silently undo the
+      # warm-up before a reviewer sends the first request, so keep it resident.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot bootstrap: pulls the model weights, then warms the model into memory and exits.
+  # The API waits for this to finish, which is what makes `docker compose up -d` actually
+  # ready to serve requests instead of failing on the first one.
+  ollama-init:
+    image: ollama/ollama:0.32.3
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "[init] Pobieram model: $$MODEL"
+        ollama pull "$$MODEL"
+        echo "[init] Rozgrzewam model (pierwszy request nie bedzie czekal na zaladowanie)"
+        ollama run "$$MODEL" "ok" > /dev/null 2>&1 || true
+        echo "[init] Model gotowy."
+    restart: "no"
+
+  # Catches every outgoing mail. Web UI on 8025. SMTP on 1025 is exposed too, so
+  # host-side tooling (E6 pytest, this project's manual check scripts) can send
+  # straight to it without going through a container.
+  mailpit:
+    image: axllent/mailpit:v1.31.0
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-120}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      MAIL_FROM: ${MAIL_FROM:-router@example.com}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/health')
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  ollama-models:
